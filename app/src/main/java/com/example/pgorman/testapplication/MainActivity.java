@@ -12,38 +12,39 @@ import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
+import android.widget.TextView;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 
-/**
- * Much of the code inspired by http://stackoverflow.com/questions/8499042/android-audiorecord-example and
- * http://stackoverflow.com/questions/19145213/android-audio-capture-silence-detection
- */
 public class MainActivity extends AppCompatActivity {
 
     private final static String Log_Tag = "gorman_smart_home";
     public static final String DefaultHomeServerBaseUrl = "http://192.168.1.149:8080";
-    private File pcmAudioFile = null;
 
-    public final static int REQUEST_AUDIO_RESULT = 5;
+    //region audio_consts
     private static final int RECORDER_SAMPLERATE = 44100;
     private static final int RECORDER_CHANNELS = AudioFormat.CHANNEL_IN_MONO;
     private static final int RECORDER_AUDIO_ENCODING = AudioFormat.ENCODING_PCM_16BIT;
+    // I think that this is derived from RECORDER_AUDIO_ENCODING
+    private static final int BYTES_PER_SAMPLE = 2;
+    private static final int NUM_SAMPLES_IN_BUFFER = 1024;
+    private static final int BUFFER_SIZE = BYTES_PER_SAMPLE * NUM_SAMPLES_IN_BUFFER;
+    //endregion
 
-    private AudioRecord recorder = null;
-    private Thread recordingThread = null;
-    private boolean isRecording = false;
+    //region silence_detection_consts
+    private static final int PCM_FORCE_SILENCE_THRESHOLD = 500;
+    private static final int MIN_SECOND_TIMEOUT = 2;
+    //endregion
 
     HueServerClient hueServerClient;
 
-    int BufferElements2Rec = 1024; // want to play 2048 (2K) since 2 bytes we use only 1024
-    int BytesPerElement = 2; // 2 bytes in 16bit format
+    private AudioRecord recorder = null;
+    private boolean isRecording = false;
+    private boolean nonSilenceDetected = false;
+
+    private static final int MAX_RECORDING_LENGTH_S = 8;
+    private int currentSoundSampleCount;
+    short[] currentSoundSamples;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -54,8 +55,8 @@ public class MainActivity extends AppCompatActivity {
         RequestUserPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE);
         RequestUserPermission(Manifest.permission.INTERNET);
 
-        pcmAudioFile = new File(this.getApplicationContext().getFileStreamPath("audiorecord.pcm").getPath());
         hueServerClient = new HueServerClient(DefaultHomeServerBaseUrl);
+        SetUserFeedbackMessage("Welcome...");
     }
 
     public void startRecordEvent(View view) {
@@ -79,74 +80,92 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startRecording() {
+        currentSoundSamples = new short[MAX_RECORDING_LENGTH_S * RECORDER_SAMPLERATE];
+        currentSoundSampleCount = 0;
+
         recorder = new AudioRecord(MediaRecorder.AudioSource.MIC,
                 RECORDER_SAMPLERATE, RECORDER_CHANNELS,
-                RECORDER_AUDIO_ENCODING, BufferElements2Rec * BytesPerElement);
+                RECORDER_AUDIO_ENCODING, BUFFER_SIZE);
 
         recorder.startRecording();
         isRecording = true;
 
-        // Start the listening thread which listens for a maximum period of time and adds sound data
-        // to the audio file.
-        recordingThread = new Thread(new Runnable() {
-            public void run() {
-                writeAudioDataToFile();
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                captureAudioData();
+                return null;
             }
-        }, "AudioRecorder Thread");
-        recordingThread.start();
+
+            @Override
+            protected void onPostExecute(Void aVoid) {
+                super.onPostExecute(aVoid);
+
+                // TODO I think I need to sync this actually, because there is a race between setting isRecording to false and releasing the recorder?
+                if(null != recorder) {
+                    recorder.stop();
+                    recorder.release();
+                    recorder = null;
+
+                    // TODO this is super weird, need to think about this better.
+                    stopRecording();
+                }
+
+                SetUserFeedbackMessage("Recording Stopped...");
+            }
+        }.execute();
+
+        SetUserFeedbackMessage("Recording...");
     }
 
     private void stopRecording() {
-        // stops the recording activity
-        if (null != recorder) {
+        if(isRecording) {
             isRecording = false;
-            recorder.stop();
-            recorder.release();
-            recorder = null;
-            recordingThread = null;
+            nonSilenceDetected = false;
         }
     }
 
-    private void writeAudioDataToFile() {
-        String filePath = pcmAudioFile.getPath();
-        short sData[] = new short[BufferElements2Rec];
+    private void SetUserFeedbackMessage(String message) {
+        TextView messageBox = (TextView)findViewById(R.id.user_feedback);
+        messageBox.setText(message);
+    }
 
-        FileOutputStream os = null;
-        try {
-            os = new FileOutputStream(filePath);
-        } catch (FileNotFoundException e) {
-            e.printStackTrace();
-        }
-
+    private void captureAudioData() {
+        short sData[] = new short[NUM_SAMPLES_IN_BUFFER];
         while (isRecording) {
-            recorder.read(sData, 0, BufferElements2Rec);
-            System.out.println("Short wirting to file" + sData.toString());
-            try {
-                // // writes the data to file from buffer
-                // // stores the voice buffer
-                byte bData[] = short2byte(sData);
-                os.write(bData, 0, BufferElements2Rec * BytesPerElement);
-            } catch (IOException e) {
-                e.printStackTrace();
+            int numSamplesRead = recorder.read(sData, 0, NUM_SAMPLES_IN_BUFFER);
+
+            if(!nonSilenceDetected) {
+                double newSampleAvgForce = computePcmForce(sData, 0, numSamplesRead - 1);
+                if(newSampleAvgForce > PCM_FORCE_SILENCE_THRESHOLD) {
+                    nonSilenceDetected = true;
+                }
+            }
+
+            // We have reached our maximum listen timeout
+            if(currentSoundSampleCount + numSamplesRead > currentSoundSamples.length) {
+                break;
+            }
+
+            if(numSamplesRead > 0) {
+                System.arraycopy(sData, 0, currentSoundSamples, currentSoundSampleCount, numSamplesRead);
+                currentSoundSampleCount += numSamplesRead;
+            }
+
+            // Waiting at least until the 2nd second to avoid leading zeros issue
+            // TODO remove leading zeroes to make this unnecessary.
+            if(nonSilenceDetected && currentSoundSampleCount > RECORDER_SAMPLERATE * MIN_SECOND_TIMEOUT) {
+                double lastSecondAvgForce = computePcmForce(
+                        currentSoundSamples,
+                        currentSoundSampleCount - RECORDER_SAMPLERATE,
+                        currentSoundSampleCount);
+
+                if(lastSecondAvgForce < PCM_FORCE_SILENCE_THRESHOLD) {
+                    Log.i(Log_Tag, "Stopping because of silence.");
+                    break;
+                }
             }
         }
-        try {
-            os.close();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    //convert short to byte
-    private byte[] short2byte(short[] sData) {
-        int shortArrsize = sData.length;
-        byte[] bytes = new byte[shortArrsize * 2];
-        for (int i = 0; i < shortArrsize; i++) {
-            bytes[i * 2] = (byte) (sData[i] & 0x00FF);
-            bytes[(i * 2) + 1] = (byte) (sData[i] >> 8);
-            sData[i] = 0;
-        }
-        return bytes;
     }
 
     // TODO this will get the permission but will crash the app, how do I handle user results.
@@ -165,8 +184,9 @@ public class MainActivity extends AppCompatActivity {
                 Log.i(Log_Tag, "SHOULD NOT SHOW");
                 // No explanation needed, we can request the permission.
 
+                // TODO what the hell is 2???
                 ActivityCompat.requestPermissions(this,
-                        new String[]{permission}, REQUEST_AUDIO_RESULT);
+                        new String[]{permission}, 2);
 
                 // MY_PERMISSIONS_REQUEST_READ_CONTACTS is an
                 // app-defined int constant. The callback method gets the
@@ -178,30 +198,73 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private static final int SPEECH_REQUEST_CODE = 0;
-
-
     public void sendToServer(View view) {
-        final byte[] pcmBytes;
-        try {
-            pcmBytes = FileUtils.readStreamToByteArray(new FileInputStream(pcmAudioFile));
-        } catch (IOException e) {
-            e.printStackTrace();
-            return;
-        }
-        AsyncTask<Void, Void, Void> task = new AsyncTask<Void, Void, Void>() {
-            @Override
-            protected Void doInBackground(Void... params) {
 
+        SetUserFeedbackMessage("Sending Command to Server...");
+
+        AsyncTask<Void, Void, SendServerCommandResult> task = new AsyncTask<Void, Void, SendServerCommandResult>() {
+            @Override
+            protected SendServerCommandResult doInBackground(Void... params) {
                 try {
-                    hueServerClient.SendAudioData(pcmBytes);
+                    byte[] soundByteData = short2byte(currentSoundSamples, currentSoundSampleCount);
+                    hueServerClient.SendAudioData(soundByteData);
                 } catch(IOException e) {
-                    Log.i(Log_Tag, e.toString());
+                    String errorMessage = "Error occurred while sending audio data to server: " + e.toString();
+                    Log.i(Log_Tag, errorMessage);
+                    return new SendServerCommandResult(false, errorMessage);
                 }
 
-                return null;
+                return new SendServerCommandResult(true, null);
+            }
+
+            @Override
+            protected void onPostExecute(SendServerCommandResult result) {
+                super.onPostExecute(result);
+
+                if(result.isSuccess()) {
+                    SetUserFeedbackMessage("Successfully Executed Command...");
+                } else {
+                    SetUserFeedbackMessage("Unexpected Error Occurred");
+                }
             }
         };
         task.execute();
     }
+
+    private double computePcmForce(short[] samples, int startIndex, int endIndex) {
+
+        if(startIndex < 0 || startIndex > samples.length - 1) {
+            throw new IllegalArgumentException("startIndex must be between 0 and the length of the array");
+        }
+
+        if(endIndex < 0 || endIndex > samples.length - 1 || endIndex < startIndex) {
+            throw new IllegalArgumentException("endIndex must be between 0 and the length of the array, and greater than the start index.");
+        }
+
+        long sum = 0;
+        for (int i=startIndex; i<=endIndex; i++) {
+            sum += Math.abs(samples[i]);
+        }
+
+        return (double) sum / (double)(endIndex - startIndex + 1);
+    }
+
+    //convert short to byte
+    private byte[] short2byte(short[] sData, int numSamples) {
+
+        if(numSamples > sData.length) {
+            throw new IllegalArgumentException("Can not specify to copy more elements from array than exist.");
+        }
+
+        int shortArrsize = sData.length;
+        byte[] bytes = new byte[numSamples * 2];
+        for (int i = 0; i < numSamples; i++) {
+            bytes[i * 2] = (byte) (sData[i] & 0x00FF);
+            bytes[(i * 2) + 1] = (byte) (sData[i] >> 8);
+            sData[i] = 0;
+        }
+
+        return bytes;
+    }
+
 }

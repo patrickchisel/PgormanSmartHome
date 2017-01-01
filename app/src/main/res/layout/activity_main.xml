@@ -23,7 +23,13 @@
     <Button
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginBottom="15dp"
         android:text="@string/button_sendAudioToServer"
         android:onClick="sendToServer"/>
+
+    <TextView android:id="@+id/user_feedback"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        />
 
 </LinearLayout>
