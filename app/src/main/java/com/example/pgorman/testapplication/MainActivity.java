@@ -1,68 +1,161 @@
 package com.example.pgorman.testapplication;
 
 import android.Manifest;
-import android.content.ContentResolver;
-import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.media.MediaPlayer;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
 import android.media.MediaRecorder;
-import android.net.Uri;
-import android.os.Environment;
-import android.speech.RecognitionListener;
-import android.speech.RecognizerIntent;
-import android.speech.SpeechRecognizer;
+import android.os.AsyncTask;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.content.ContextCompat;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
-import android.widget.EditText;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.List;
 
+/**
+ * Much of the code inspired by http://stackoverflow.com/questions/8499042/android-audiorecord-example and
+ * http://stackoverflow.com/questions/19145213/android-audio-capture-silence-detection
+ */
 public class MainActivity extends AppCompatActivity {
 
-    public final static String EXTRA_MESSAGE = "com.example.myfirstapp.MESSAGE";
-
     private final static String Log_Tag = "gorman_smart_home";
-
-    public String lastString = "";
+    public static final String DefaultHomeServerBaseUrl = "http://192.168.1.149:8080";
+    private File pcmAudioFile = null;
 
     public final static int REQUEST_AUDIO_RESULT = 5;
+    private static final int RECORDER_SAMPLERATE = 44100;
+    private static final int RECORDER_CHANNELS = AudioFormat.CHANNEL_IN_MONO;
+    private static final int RECORDER_AUDIO_ENCODING = AudioFormat.ENCODING_PCM_16BIT;
 
-    private File audioFile = null;
+    private AudioRecord recorder = null;
+    private Thread recordingThread = null;
+    private boolean isRecording = false;
 
-    SpeechRecognizer recognizer;
+    HueServerClient hueServerClient;
 
-    MediaRecorder myAudioRecorder = null;
-    MediaPlayer mediaPlayer = null;
+    int BufferElements2Rec = 1024; // want to play 2048 (2K) since 2 bytes we use only 1024
+    int BytesPerElement = 2; // 2 bytes in 16bit format
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        audioFile = new File(Environment.getExternalStorageDirectory().getAbsolutePath(),  "/audiorecordtest.3gp");
-        audioFile = new File(this.getApplicationContext().getFileStreamPath("audiorecordtest.3gp").getPath());
-
-
         RequestUserPermission(Manifest.permission.RECORD_AUDIO);
         RequestUserPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE);
-        RequestUserPermission(Manifest.permission.READ_EXTERNAL_STORAGE);
+        RequestUserPermission(Manifest.permission.INTERNET);
+
+        pcmAudioFile = new File(this.getApplicationContext().getFileStreamPath("audiorecord.pcm").getPath());
+        hueServerClient = new HueServerClient(DefaultHomeServerBaseUrl);
     }
 
+    public void startRecordEvent(View view) {
+        setRecording(true);
+    }
+
+    public void endRecordEvent(View view) {
+        setRecording(false);
+    }
+
+    private synchronized void setRecording(boolean record) {
+        if(record == isRecording) {
+            return;
+        }
+
+        if(record) {
+            startRecording();
+        } else {
+            stopRecording();
+        }
+    }
+
+    private void startRecording() {
+        recorder = new AudioRecord(MediaRecorder.AudioSource.MIC,
+                RECORDER_SAMPLERATE, RECORDER_CHANNELS,
+                RECORDER_AUDIO_ENCODING, BufferElements2Rec * BytesPerElement);
+
+        recorder.startRecording();
+        isRecording = true;
+
+        // Start the listening thread which listens for a maximum period of time and adds sound data
+        // to the audio file.
+        recordingThread = new Thread(new Runnable() {
+            public void run() {
+                writeAudioDataToFile();
+            }
+        }, "AudioRecorder Thread");
+        recordingThread.start();
+    }
+
+    private void stopRecording() {
+        // stops the recording activity
+        if (null != recorder) {
+            isRecording = false;
+            recorder.stop();
+            recorder.release();
+            recorder = null;
+            recordingThread = null;
+        }
+    }
+
+    private void writeAudioDataToFile() {
+        String filePath = pcmAudioFile.getPath();
+        short sData[] = new short[BufferElements2Rec];
+
+        FileOutputStream os = null;
+        try {
+            os = new FileOutputStream(filePath);
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        }
+
+        while (isRecording) {
+            recorder.read(sData, 0, BufferElements2Rec);
+            System.out.println("Short wirting to file" + sData.toString());
+            try {
+                // // writes the data to file from buffer
+                // // stores the voice buffer
+                byte bData[] = short2byte(sData);
+                os.write(bData, 0, BufferElements2Rec * BytesPerElement);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        try {
+            os.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    //convert short to byte
+    private byte[] short2byte(short[] sData) {
+        int shortArrsize = sData.length;
+        byte[] bytes = new byte[shortArrsize * 2];
+        for (int i = 0; i < shortArrsize; i++) {
+            bytes[i * 2] = (byte) (sData[i] & 0x00FF);
+            bytes[(i * 2) + 1] = (byte) (sData[i] >> 8);
+            sData[i] = 0;
+        }
+        return bytes;
+    }
+
+    // TODO this will get the permission but will crash the app, how do I handle user results.
+    // TODO for now doesn't really matter because the permissions are on my phone.
     private void RequestUserPermission(String permission) {
-        if(ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+        if(ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED)
         {
             // Should we show an explanation?
-            if (ActivityCompat.shouldShowRequestPermissionRationale(this,
-                    Manifest.permission.RECORD_AUDIO)) {
+            if (ActivityCompat.shouldShowRequestPermissionRationale(this, permission)) {
 
                 // Show an explanation to the user *asynchronously* -- don't block
                 // this thread waiting for the user's response! After the user
@@ -73,8 +166,7 @@ public class MainActivity extends AppCompatActivity {
                 // No explanation needed, we can request the permission.
 
                 ActivityCompat.requestPermissions(this,
-                        new String[]{Manifest.permission.RECORD_AUDIO},
-                        REQUEST_AUDIO_RESULT);
+                        new String[]{permission}, REQUEST_AUDIO_RESULT);
 
                 // MY_PERMISSIONS_REQUEST_READ_CONTACTS is an
                 // app-defined int constant. The callback method gets the
@@ -82,106 +174,34 @@ public class MainActivity extends AppCompatActivity {
             }
         } else {
             // TODO this actually doesn't work, it is just cached from last time. Fix it later.
-            Log.i(Log_Tag, "Already have permissions to record audio.");
+            Log.i(Log_Tag, "Already have permissions to " + permission);
         }
     }
 
     private static final int SPEECH_REQUEST_CODE = 0;
 
-    public void startRecord(View view) {
-        myAudioRecorder = new MediaRecorder();
-        myAudioRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-        myAudioRecorder.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP);
-        myAudioRecorder.setAudioEncoder(MediaRecorder.OutputFormat.AMR_NB);
-        myAudioRecorder.setOutputFile(audioFile.getPath());
 
-
+    public void sendToServer(View view) {
+        final byte[] pcmBytes;
         try {
-            myAudioRecorder.prepare();
+            pcmBytes = FileUtils.readStreamToByteArray(new FileInputStream(pcmAudioFile));
         } catch (IOException e) {
-            Log.e(Log_Tag, "prepare() recorder failed");
+            e.printStackTrace();
             return;
         }
+        AsyncTask<Void, Void, Void> task = new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
 
-        myAudioRecorder.start();
-    }
+                try {
+                    hueServerClient.SendAudioData(pcmBytes);
+                } catch(IOException e) {
+                    Log.i(Log_Tag, e.toString());
+                }
 
-    public void endRecord(View view) {
-        myAudioRecorder.stop();
-        myAudioRecorder.release();
-        myAudioRecorder = null;
-    }
-
-    public void startPlayback(View view) {
-        mediaPlayer = new MediaPlayer();
-        try {
-            mediaPlayer.setDataSource(audioFile.getPath());
-            mediaPlayer.prepare();
-            mediaPlayer.start();
-        } catch (IOException e) {
-            Log.e(Log_Tag, "prepare() player failed");
-        }
-    }
-
-    public void endPlayback(View view){
-        mediaPlayer.release();
-        mediaPlayer = null;
-    }
-
-    private void StartSpeechRecognizerIntent() {
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,  RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra("android.speech.extra.GET_AUDIO_FORMAT", "audio/AMR");
-        intent.putExtra("android.speech.extra.GET_AUDIO", true);
-        // Start the activity, the intent will be populated with the speech text
-        startActivityForResult(intent, SPEECH_REQUEST_CODE);
-    }
-
-    // This callback is invoked when the Speech Recognizer returns.
-    // This is where you process the intent and extract the speech text from the intent.
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode,
-                                    Intent data) {
-        // TODO use SpeecRecognizer class.
-
-        if (requestCode == SPEECH_REQUEST_CODE && resultCode == RESULT_OK) {
-            List<String> results = data.getStringArrayListExtra(
-                    RecognizerIntent.EXTRA_RESULTS);
-            try {
-                Uri audioUri = data.getData();
-                ContentResolver contentResolver = getContentResolver();
-                InputStream filestream = contentResolver.openInputStream(audioUri);
-
-                byte[] bytes = readBytes(filestream);
-                Log.i(Log_Tag, "Found " + bytes.length + " bytes of audio.");
-            } catch(Exception e) {
-                int y = 5;
+                return null;
             }
-
-
-        } else if(resultCode == RESULT_CANCELED) {
-            int x = 5;
-        }
-        super.onActivityResult(requestCode, resultCode, data);
-    }
-
-
-
-    public byte[] readBytes(InputStream inputStream) throws IOException {
-        // this dynamically extends to take the bytes you read
-        ByteArrayOutputStream byteBuffer = new ByteArrayOutputStream();
-
-        // this is storage overwritten on each iteration with bytes
-        int bufferSize = 1024;
-        byte[] buffer = new byte[bufferSize];
-
-        // we need to know how may bytes were read to write them to the byteBuffer
-        int len = 0;
-        while ((len = inputStream.read(buffer)) != -1) {
-            byteBuffer.write(buffer, 0, len);
-        }
-
-        // and then we can return your byte array.
-        return byteBuffer.toByteArray();
+        };
+        task.execute();
     }
 }

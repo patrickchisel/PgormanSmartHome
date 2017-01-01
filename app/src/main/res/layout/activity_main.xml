@@ -7,27 +7,23 @@
     android:orientation="vertical">
 
     <Button
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginBottom="15dp"
         android:text="@string/button_startAudioCapture"
-        android:onClick="startRecord"/>
+        android:onClick="startRecordEvent"/>
 
     <Button
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginBottom="15dp"
         android:text="@string/button_endAudioCapture"
-        android:onClick="endRecord"/>
+        android:onClick="endRecordEvent"/>
 
     <Button
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="@string/button_startAudioPlayback"
-        android:onClick="startPlayback"/>
-
-    <Button
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="@string/button_endAudioPlayback"
-        android:onClick="endPlayback"/>
+        android:text="@string/button_sendAudioToServer"
+        android:onClick="sendToServer"/>
 
 </LinearLayout>

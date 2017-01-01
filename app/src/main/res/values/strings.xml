@@ -5,6 +5,5 @@
     <string name="button_dostuff">Do Stuff</string>
     <string name="button_startAudioCapture">Start Record</string>
     <string name="button_endAudioCapture">End Record</string>
-    <string name="button_startAudioPlayback">Start Playback</string>
-    <string name="button_endAudioPlayback">End Playback</string>
+    <string name="button_sendAudioToServer">Send to Server</string>
 </resources>
