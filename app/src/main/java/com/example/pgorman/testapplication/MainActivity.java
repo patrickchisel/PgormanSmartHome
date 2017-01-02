@@ -11,7 +11,6 @@ import android.support.v4.content.ContextCompat;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
-import android.view.View;
 import android.widget.TextView;
 
 import java.io.IOException;
@@ -32,19 +31,23 @@ public class MainActivity extends AppCompatActivity {
     //endregion
 
     //region silence_detection_consts
-    private static final int PCM_FORCE_SILENCE_THRESHOLD = 500;
+    private static final int PCM_FORCE_SILENCE_THRESHOLD = 1000;
     private static final int MIN_SECOND_TIMEOUT = 2;
     //endregion
 
     HueServerClient hueServerClient;
 
     private AudioRecord recorder = null;
-    private boolean isRecording = false;
+    private boolean appRunning = false;
     private boolean nonSilenceDetected = false;
 
     private static final int MAX_RECORDING_LENGTH_S = 8;
     private int currentSoundSampleCount;
     short[] currentSoundSamples;
+
+    private InitCommandTimeout initCommandTimeout;
+
+    CommandFeedbackAudioPlayer commandAudio;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -56,41 +59,63 @@ public class MainActivity extends AppCompatActivity {
         RequestUserPermission(Manifest.permission.INTERNET);
 
         hueServerClient = new HueServerClient(DefaultHomeServerBaseUrl);
-        SetUserFeedbackMessage("Welcome...");
     }
 
-    public void startRecordEvent(View view) {
-        setRecording(true);
-    }
+    @Override
+    protected void onStart() {
+        super.onStart();
 
-    public void endRecordEvent(View view) {
-        setRecording(false);
-    }
+        appRunning = true;
+        commandAudio = new CommandFeedbackAudioPlayer();
+        initCommandTimeout = new InitCommandTimeout();
+        initCommandTimoutTask();
 
-    private synchronized void setRecording(boolean record) {
-        if(record == isRecording) {
-            return;
+        if(null == recorder) {
+            recorder = new AudioRecord(MediaRecorder.AudioSource.MIC,
+                    RECORDER_SAMPLERATE, RECORDER_CHANNELS,
+                    RECORDER_AUDIO_ENCODING, BUFFER_SIZE);
+
+            recorder.startRecording();
+
         }
 
-        if(record) {
-            startRecording();
-        } else {
-            stopRecording();
+        startSpeechDetectionCycle();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        appRunning = false;
+
+        // TODO this is janky, I should use locking instead of sleeping to solve this.
+        try {
+            Thread.sleep(250);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+        commandAudio.release();
+
+        if(null != recorder) {
+            System.out.println("Starting Destroy recorder");
+            recorder.stop();
+            recorder.release();
+            recorder = null;
+            System.out.println("Finish Destroy recorder");
         }
     }
 
-    private void startRecording() {
+    private void startSpeechDetectionCycle() {
         currentSoundSamples = new short[MAX_RECORDING_LENGTH_S * RECORDER_SAMPLERATE];
         currentSoundSampleCount = 0;
 
-        recorder = new AudioRecord(MediaRecorder.AudioSource.MIC,
-                RECORDER_SAMPLERATE, RECORDER_CHANNELS,
-                RECORDER_AUDIO_ENCODING, BUFFER_SIZE);
+        TaskUtils.startTask(new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected void onPreExecute() {
+                super.onPreExecute();
+                SetUserFeedbackMessage("Recording...");
+            }
 
-        recorder.startRecording();
-        isRecording = true;
-
-        new AsyncTask<Void, Void, Void>() {
             @Override
             protected Void doInBackground(Void... params) {
                 captureAudioData();
@@ -100,29 +125,71 @@ public class MainActivity extends AppCompatActivity {
             @Override
             protected void onPostExecute(Void aVoid) {
                 super.onPostExecute(aVoid);
+                boolean commandDetected = nonSilenceDetected;
+                resetSilenceDetection();
+                SetUserFeedbackMessage("Recording Stopped...");
 
-                // TODO I think I need to sync this actually, because there is a race between setting isRecording to false and releasing the recorder?
-                if(null != recorder) {
-                    recorder.stop();
-                    recorder.release();
-                    recorder = null;
-
-                    // TODO this is super weird, need to think about this better.
-                    stopRecording();
+                // The app has been stopped.
+                if(!appRunning) {
+                    return;
                 }
 
-                SetUserFeedbackMessage("Recording Stopped...");
-            }
-        }.execute();
+                if(commandDetected) {
+                    if(initCommandTimeout.checkAndRefreshInitCommand()) {
+                        SetUserFeedbackMessage("Command Detected, Sending to Server...");
+                        sendCommandToServer();
 
-        SetUserFeedbackMessage("Recording...");
+                    } else {
+                        SetUserFeedbackMessage("Init Detected, Sending to Server...");
+                        sendInitToServer();
+                    }
+                } else {
+                    startSpeechDetectionCycle();
+                }
+            }
+        });
     }
 
-    private void stopRecording() {
-        if(isRecording) {
-            isRecording = false;
-            nonSilenceDetected = false;
-        }
+    private void initCommandTimoutTask() {
+        TaskUtils.startTask(new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                boolean isUncapturedTimeout = false;
+
+                while(!isUncapturedTimeout && appRunning) {
+                    isUncapturedTimeout = initCommandTimeout.checkIfUncapturedTimeout();
+
+                    if(isUncapturedTimeout) {
+                        break;
+                    }
+
+                    try {
+                        Thread.sleep(250);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                return null;
+            }
+
+            @Override
+            protected void onPostExecute(Void result) {
+                // app is stopped.
+                if(!appRunning) {
+                    return;
+                }
+
+                commandAudio.PlayCommandTimeout(MainActivity.this);
+
+                SetUserFeedbackMessage("*BEEP NOISE* -> Command timeout Ended.");
+                initCommandTimoutTask();
+            }
+        });
+    }
+
+    private void resetSilenceDetection() {
+        nonSilenceDetected = false;
     }
 
     private void SetUserFeedbackMessage(String message) {
@@ -132,14 +199,16 @@ public class MainActivity extends AppCompatActivity {
 
     private void captureAudioData() {
         short sData[] = new short[NUM_SAMPLES_IN_BUFFER];
-        while (isRecording) {
+        while (appRunning) {
+
             int numSamplesRead = recorder.read(sData, 0, NUM_SAMPLES_IN_BUFFER);
 
+            // Once we detect non-silence, we begin to record up to MAX_RECORDING_LENGTH_S worth of audio.
             if(!nonSilenceDetected) {
-                double newSampleAvgForce = computePcmForce(sData, 0, numSamplesRead - 1);
-                if(newSampleAvgForce > PCM_FORCE_SILENCE_THRESHOLD) {
+                if (!IsSilenceDetected(sData, 0, numSamplesRead - 1)) {
                     nonSilenceDetected = true;
                 }
+                continue;
             }
 
             // We have reached our maximum listen timeout
@@ -155,17 +224,16 @@ public class MainActivity extends AppCompatActivity {
             // Waiting at least until the 2nd second to avoid leading zeros issue
             // TODO remove leading zeroes to make this unnecessary.
             if(nonSilenceDetected && currentSoundSampleCount > RECORDER_SAMPLERATE * MIN_SECOND_TIMEOUT) {
-                double lastSecondAvgForce = computePcmForce(
-                        currentSoundSamples,
-                        currentSoundSampleCount - RECORDER_SAMPLERATE,
-                        currentSoundSampleCount);
-
-                if(lastSecondAvgForce < PCM_FORCE_SILENCE_THRESHOLD) {
+                if(IsSilenceDetected(currentSoundSamples, currentSoundSampleCount - RECORDER_SAMPLERATE, currentSoundSampleCount - 1)) {
                     Log.i(Log_Tag, "Stopping because of silence.");
                     break;
                 }
             }
         }
+    }
+
+    private boolean IsSilenceDetected(short[] soundSamples, int startIndex, int endIndex) {
+        return computePcmForce(soundSamples, startIndex, endIndex) < PCM_FORCE_SILENCE_THRESHOLD;
     }
 
     // TODO this will get the permission but will crash the app, how do I handle user results.
@@ -185,8 +253,7 @@ public class MainActivity extends AppCompatActivity {
                 // No explanation needed, we can request the permission.
 
                 // TODO what the hell is 2???
-                ActivityCompat.requestPermissions(this,
-                        new String[]{permission}, 2);
+                ActivityCompat.requestPermissions(this, new String[]{permission}, 2);
 
                 // MY_PERMISSIONS_REQUEST_READ_CONTACTS is an
                 // app-defined int constant. The callback method gets the
@@ -198,37 +265,76 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    public void sendToServer(View view) {
-
-        SetUserFeedbackMessage("Sending Command to Server...");
-
-        AsyncTask<Void, Void, SendServerCommandResult> task = new AsyncTask<Void, Void, SendServerCommandResult>() {
+    // TODO share code with sendCommandToServer
+    private void sendInitToServer() {
+        TaskUtils.startTask(new AsyncTask<Void, Void, Boolean>() {
             @Override
-            protected SendServerCommandResult doInBackground(Void... params) {
+            protected void onPreExecute() {
+                super.onPreExecute();
+                SetUserFeedbackMessage("Sending Init to Server...");
+            }
+
+            @Override
+            protected Boolean doInBackground(Void... params) {
                 try {
                     byte[] soundByteData = short2byte(currentSoundSamples, currentSoundSampleCount);
-                    hueServerClient.SendAudioData(soundByteData);
+                    boolean initReceived = hueServerClient.SendInitAudioData(soundByteData);
+                    return initReceived;
+                } catch(IOException e) {
+                    String errorMessage = "Error occurred while sending init data to server: " + e.toString();
+                    Log.i(Log_Tag, errorMessage);
+                    return false;
+                }
+            }
+
+            @Override
+            protected void onPostExecute(Boolean result) {
+                super.onPostExecute(result);
+                if(result) {
+                    commandAudio.PlayCommandInit(MainActivity.this);
+                    initCommandTimeout.setInitCommandReceived();
+                }
+                startSpeechDetectionCycle();
+            }
+        });
+    }
+
+    private void sendCommandToServer() {
+        TaskUtils.startTask(new AsyncTask<Void, Void, Boolean>() {
+            @Override
+            protected void onPreExecute() {
+                super.onPreExecute();
+                SetUserFeedbackMessage("Sending Command to Server...");
+            }
+
+            @Override
+            protected Boolean doInBackground(Void... params) {
+                try {
+                    byte[] soundByteData = short2byte(currentSoundSamples, currentSoundSampleCount);
+                    boolean commandExecuted = hueServerClient.SendCommandAudioData(soundByteData);
+                    return commandExecuted;
                 } catch(IOException e) {
                     String errorMessage = "Error occurred while sending audio data to server: " + e.toString();
                     Log.i(Log_Tag, errorMessage);
-                    return new SendServerCommandResult(false, errorMessage);
+                    return false;
                 }
-
-                return new SendServerCommandResult(true, null);
             }
 
             @Override
-            protected void onPostExecute(SendServerCommandResult result) {
+            protected void onPostExecute(Boolean result) {
                 super.onPostExecute(result);
 
-                if(result.isSuccess()) {
+                if(result) {
+                    commandAudio.PlayCommandAck(MainActivity.this);
                     SetUserFeedbackMessage("Successfully Executed Command...");
+                    initCommandTimeout.resetCommandTimeout();
                 } else {
                     SetUserFeedbackMessage("Unexpected Error Occurred");
                 }
+
+                startSpeechDetectionCycle();
             }
-        };
-        task.execute();
+        });
     }
 
     private double computePcmForce(short[] samples, int startIndex, int endIndex) {
@@ -256,7 +362,6 @@ public class MainActivity extends AppCompatActivity {
             throw new IllegalArgumentException("Can not specify to copy more elements from array than exist.");
         }
 
-        int shortArrsize = sData.length;
         byte[] bytes = new byte[numSamples * 2];
         for (int i = 0; i < numSamples; i++) {
             bytes[i * 2] = (byte) (sData[i] & 0x00FF);
